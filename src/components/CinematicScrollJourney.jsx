@@ -1,4 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
+import gsap from 'gsap';
+import { ScrollTrigger } from 'gsap/ScrollTrigger';
+
+gsap.registerPlugin(ScrollTrigger);
 
 const SCENES = [
   {
@@ -36,193 +40,287 @@ const SCENES = [
 
 export default function CinematicScrollJourney({ onOpenInquiry, onOpenDossier }) {
   const containerRef = useRef(null);
-  const trackRef = useRef(null);
   const stageRef = useRef(null);
-  const [activeSceneIndex, setActiveSceneIndex] = useState(0);
-  const [overallProgress, setOverallProgress] = useState(0);
-  const [scrollHintVisible, setScrollHintVisible] = useState(true);
-
-  // Video refs
+  const trackRef = useRef(null);
   const videoRefs = useRef([]);
-  const targetProgressRef = useRef(0);
-  const currentProgressRef = useRef(0);
-  const lastScrollYRef = useRef(0);
-  const scrollTimeoutRef = useRef(null);
-  const isUserScrollingRef = useRef(false);
+
+  // Active scene index for UI highlights (only updated when scene boundary crosses)
+  const [activeScene, setActiveScene] = useState(0);
+  const [scrollHint, setScrollHint] = useState(true);
+
+  // Overlay refs for hardware-accelerated transforms
+  const heroRef = useRef(null);
+  const scene2Ref = useRef(null);
+  const scene3Ref = useRef(null);
+  const scene4Ref = useRef(null);
+  const badgeRef = useRef(null);
+
+  // Scroll and video coordination refs
+  const progressRef = useRef(0);
+  const targetTimesRef = useRef([0, 0, 0, 0]);
+  const lastProgressRef = useRef(0);
+
+  const videoMeta = useRef([
+    { duration: 8, isReady: false, isSeeking: false },
+    { duration: 8, isReady: false, isSeeking: false },
+    { duration: 8, isReady: false, isSeeking: false },
+    { duration: 8, isReady: false, isSeeking: false },
+  ]);
 
   useEffect(() => {
     const track = trackRef.current;
-    if (!track) return;
+    const stage = stageRef.current;
+    if (!track || !stage) return;
 
-    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    // 6.4vh: Generous, balanced scroll distance for full 4-video flight and smooth dissolve
-    const TOTAL_SCROLL_VH = 6.4;
-    const vh = window.innerHeight;
+    // Set generous scroll track height (600vh) without layout jumping
+    const TRACK_VH = 6.0;
+    track.style.height = `${TRACK_VH * 100}vh`;
 
-    track.style.height = `${TOTAL_SCROLL_VH * vh}px`;
+    // 1. Initialize all 4 videos
+    videoRefs.current.forEach((vid, idx) => {
+      if (!vid) return;
 
-    // Initialize all 4 videos
-    SCENES.forEach((sec, idx) => {
-      const v = videoRefs.current[idx];
-      if (!v) return;
+      vid.muted = true;
+      vid.playsInline = true;
+      vid.setAttribute('playsinline', '');
+      vid.setAttribute('webkit-playsinline', '');
 
-      v.muted = true;
-      v.playsInline = true;
-      v.setAttribute('playsinline', '');
-      v.setAttribute('webkit-playsinline', '');
-      v.src = sec.src;
-      v.load();
+      const onMeta = () => {
+        if (vid.duration && !isNaN(vid.duration)) {
+          videoMeta.current[idx].duration = vid.duration;
+          videoMeta.current[idx].isReady = true;
+        }
+      };
+
+      const onSeeking = () => {
+        videoMeta.current[idx].isSeeking = true;
+      };
+
+      const onSeeked = () => {
+        videoMeta.current[idx].isSeeking = false;
+        const target = targetTimesRef.current[idx];
+        if (Math.abs(target - vid.currentTime) > 0.02 && !vid.seeking) {
+          vid.currentTime = target;
+        }
+      };
+
+      vid.addEventListener('loadedmetadata', onMeta);
+      vid.addEventListener('seeking', onSeeking);
+      vid.addEventListener('seeked', onSeeked);
+
+      if (vid.readyState >= 1 && vid.duration) {
+        onMeta();
+      }
     });
 
-    // Touch / gesture priming for instant GPU decode on all 4 videos
-    const primeAll = () => {
-      videoRefs.current.forEach((v) => {
-        if (!v) return;
-        try {
-          const p = v.play();
-          if (p && p.then) {
-            p.then(() => {
-              try {
-                v.pause();
-              } catch (e) {}
-            }).catch(() => {});
-          }
-        } catch (e) {}
+    // 2. Gesture priming for mobile GPU decoders
+    const primeVideos = () => {
+      videoRefs.current.forEach((vid) => {
+        if (vid && vid.paused) {
+          try {
+            const p = vid.play();
+            if (p && p.then) {
+              p.then(() => vid.pause()).catch(() => {});
+            }
+          } catch (e) {}
+        }
       });
     };
-    window.addEventListener('pointerdown', primeAll, { once: true, passive: true });
-    window.addEventListener('touchstart', primeAll, { once: true, passive: true });
+    window.addEventListener('pointerdown', primeVideos, { once: true, passive: true });
+    window.addEventListener('touchstart', primeVideos, { once: true, passive: true });
 
-    // Track scroll position
-    const handleScroll = () => {
-      const scrollY = window.scrollY || window.pageYOffset;
-      const totalTrackH = TOTAL_SCROLL_VH * vh;
-      const rawProg = Math.max(0, Math.min(1, scrollY / totalTrackH));
-      targetProgressRef.current = rawProg;
+    // 3. GSAP ScrollTrigger with scrub: 0.4 for silky physics-based momentum
+    let lastSceneIdx = 0;
+    const ctx = gsap.context(() => {
+      ScrollTrigger.create({
+        trigger: track,
+        start: 'top top',
+        end: 'bottom bottom',
+        scrub: 0.4, // Requirement 10: scrub 0.3-0.5
+        invalidateOnRefresh: true,
+        onUpdate: (self) => {
+          progressRef.current = self.progress;
 
-      lastScrollYRef.current = scrollY;
-      isUserScrollingRef.current = true;
+          // Update scroll cue visibility
+          if (self.progress > 0.03 && scrollHint) {
+            setScrollHint(false);
+          } else if (self.progress <= 0.03 && !scrollHint) {
+            setScrollHint(true);
+          }
+        },
+      });
+    }, containerRef);
 
-      setScrollHintVisible(scrollY < 0.2 * vh);
-
-      clearTimeout(scrollTimeoutRef.current);
-      scrollTimeoutRef.current = setTimeout(() => {
-        isUserScrollingRef.current = false;
-        videoRefs.current.forEach((vid) => {
-          if (vid && !vid.paused) vid.pause();
-        });
-      }, 140);
-    };
-
-    window.addEventListener('scroll', handleScroll, { passive: true });
-
-    // 60FPS Hardware-Accelerated Animation Loop
+    // 4. 60FPS requestAnimationFrame update loop
     let rafId;
     const updateLoop = () => {
-      const targetP = targetProgressRef.current;
-      const currentP = currentProgressRef.current;
+      const p = progressRef.current;
+      const isForward = p >= lastProgressRef.current;
+      lastProgressRef.current = p;
 
-      // Silky smooth interpolation
-      const lerpFactor = reduce ? 1 : 0.22;
-      const nextP = currentP + (targetP - currentP) * lerpFactor;
-      currentProgressRef.current = nextP;
-
-      setOverallProgress(nextP);
-
-      // Determine active scene
+      // Determine active scene (only trigger React state when boundary crossed!)
       let activeIdx = 0;
-      if (nextP >= 0.66) activeIdx = 3;
-      else if (nextP >= 0.44) activeIdx = 2;
-      else if (nextP >= 0.22) activeIdx = 1;
+      if (p >= 0.74) activeIdx = 3;
+      else if (p >= 0.49) activeIdx = 2;
+      else if (p >= 0.24) activeIdx = 1;
 
-      setActiveSceneIndex(activeIdx);
-
-      // Smooth fade-out of the entire video flight when scrolling into the portfolio below
-      if (stageRef.current) {
-        if (nextP > 0.93) {
-          const stageOp = Math.max(0, 1 - (nextP - 0.93) / 0.06);
-          stageRef.current.style.opacity = stageOp;
-          stageRef.current.style.pointerEvents = stageOp < 0.1 ? 'none' : 'auto';
-        } else {
-          stageRef.current.style.opacity = 1;
+      if (activeIdx !== lastSceneIdx) {
+        lastSceneIdx = activeIdx;
+        setActiveScene(activeIdx);
+        if (badgeRef.current) {
+          badgeRef.current.textContent = SCENES[activeIdx].badge;
         }
       }
 
-      // Process all 4 videos
+      // --- ZERO-DIP LAYERED CROSSFADES ---
+      // Video 0: base layer (zIndex 10)
+      // Video 1: zIndex 11 (fades in 0.19 -> 0.24 over Video 0, stays until 0.49)
+      // Video 2: zIndex 12 (fades in 0.44 -> 0.49 over Video 1, stays until 0.74)
+      // Video 3: zIndex 13 (fades in 0.69 -> 0.74 over Video 2, stays until 0.94, exit fade to 1.0)
+
+      let op0 = 0;
+      if (p <= 0.24) op0 = 1;
+      else op0 = 0;
+
+      let op1 = 0;
+      if (p < 0.19) op1 = 0;
+      else if (p <= 0.24) op1 = (p - 0.19) / 0.05;
+      else if (p <= 0.49) op1 = 1;
+      else op1 = 0;
+
+      let op2 = 0;
+      if (p < 0.44) op2 = 0;
+      else if (p <= 0.49) op2 = (p - 0.44) / 0.05;
+      else if (p <= 0.74) op2 = 1;
+      else op2 = 0;
+
+      let op3 = 0;
+      if (p < 0.69) op3 = 0;
+      else if (p <= 0.74) op3 = (p - 0.69) / 0.05;
+      else if (p <= 0.94) op3 = 1;
+      else op3 = Math.max(0, 1 - (p - 0.94) / 0.06);
+
+      const opacities = [op0, op1, op2, op3];
+
+      // Local progress for each video
+      const localP0 = Math.min(1, Math.max(0, p / 0.24));
+      const localP1 = Math.min(1, Math.max(0, (p - 0.19) / 0.28));
+      const localP2 = Math.min(1, Math.max(0, (p - 0.44) / 0.28));
+      const localP3 = Math.min(1, Math.max(0, (p - 0.69) / 0.24));
+      const localProgress = [localP0, localP1, localP2, localP3];
+
+      // Preload next video before current ends (Requirement 7)
+      const shouldWarm = [
+        p <= 0.30,              // Video 0 kept warm for reverse
+        p >= 0.12 && p <= 0.55, // Video 1 preloaded at 0.12
+        p >= 0.37 && p <= 0.80, // Video 2 preloaded at 0.37
+        p >= 0.62,              // Video 3 preloaded at 0.62
+      ];
+
+      // Video playback & seeking control
       for (let i = 0; i < 4; i++) {
         const vid = videoRefs.current[i];
+        const meta = videoMeta.current[i];
         if (!vid) continue;
 
-        // Scene local progress (0 to 1)
-        let localP = 0;
-        if (i === 0) localP = Math.max(0, Math.min(1, nextP / 0.22));
-        else if (i === 1) localP = Math.max(0, Math.min(1, (nextP - 0.22) / 0.22));
-        else if (i === 2) localP = Math.max(0, Math.min(1, (nextP - 0.44) / 0.22));
-        else if (i === 3) localP = Math.max(0, Math.min(1, (nextP - 0.66) / 0.25));
+        const op = opacities[i];
+        const isWarm = shouldWarm[i];
 
-        // Seamless 4% crossfade window between scenes
-        let opacity = 0;
-        if (i === 0) {
-          if (nextP < 0.20) opacity = 1;
-          else if (nextP <= 0.24) opacity = 1 - (nextP - 0.20) / 0.04;
-          else opacity = 0;
-        } else if (i === 1) {
-          if (nextP < 0.20) opacity = 0;
-          else if (nextP < 0.24) opacity = (nextP - 0.20) / 0.04;
-          else if (nextP <= 0.42) opacity = 1;
-          else if (nextP <= 0.46) opacity = 1 - (nextP - 0.42) / 0.04;
-          else opacity = 0;
-        } else if (i === 2) {
-          if (nextP < 0.42) opacity = 0;
-          else if (nextP < 0.46) opacity = (nextP - 0.42) / 0.04;
-          else if (nextP <= 0.64) opacity = 1;
-          else if (nextP <= 0.68) opacity = 1 - (nextP - 0.64) / 0.04;
-          else opacity = 0;
-        } else if (i === 3) {
-          // Scene 4: fades in at 0.64-0.68, plays full flight to 0.93, then smoothly dissolves
-          if (nextP < 0.64) opacity = 0;
-          else if (nextP < 0.68) opacity = (nextP - 0.64) / 0.04;
-          else if (nextP <= 0.93) opacity = 1;
-          else opacity = Math.max(0, 1 - (nextP - 0.93) / 0.06);
-        }
+        vid.style.opacity = op;
+        vid.style.zIndex = String(10 + i);
 
-        vid.style.opacity = opacity;
-
-        // Hide inactive videos to free up GPU decoder pipelines
-        if (opacity <= 0.001) {
-          vid.style.visibility = 'hidden';
+        if (op <= 0.001 && !isWarm) {
           if (!vid.paused) vid.pause();
           continue;
         }
 
-        vid.style.visibility = 'visible';
-        vid.style.zIndex = i === activeIdx ? '12' : String(10 + Math.round(opacity * 2));
+        const dur = meta.duration || 8;
+        const targetTime = Math.max(0, Math.min(dur - 0.05, localProgress[i] * dur));
+        targetTimesRef.current[i] = targetTime;
+        const timeDiff = Math.abs(targetTime - vid.currentTime);
 
-        // Precision Playback & Scrubbing
-        const dur = vid.duration || 8;
-        const targetTime = Math.max(0, Math.min(dur - 0.06, localP * dur));
-        const timeDiff = targetTime - vid.currentTime;
+        // Keep video paused — pure 60fps scroll scrubbing without play/pause stutter
+        if (!vid.paused) {
+          vid.pause();
+        }
 
-        // Forward scroll: hardware 60fps play
-        if (isUserScrollingRef.current && (targetP >= currentP) && localP < 0.98) {
-          if (vid.paused) {
-            vid.play().catch(() => {});
+        // Only seek if video is currently visible or warming up
+        if (op > 0.001 || isWarm) {
+          if (meta.isSeeking && !vid.seeking) {
+            meta.isSeeking = false;
           }
-          if (timeDiff > 0.4) {
-            vid.playbackRate = 1.4;
-          } else if (timeDiff < -0.2) {
-            vid.playbackRate = 0.85;
-          } else {
-            vid.playbackRate = 1.0;
-          }
-        } else {
-          // Backward scroll, paused, or settled
-          if (!vid.paused) {
-            vid.pause();
-          }
-          if (!vid.seeking && Math.abs(timeDiff) > 0.035) {
+          // Seek threshold: 0.02s (~1 frame at 60fps)
+          if (!meta.isSeeking && timeDiff > 0.02) {
+            meta.isSeeking = true;
             vid.currentTime = targetTime;
           }
+        }
+      }
+
+      // --- TEXT OVERLAYS HARDWARE ACCELERATION ---
+      // Scene 1 Hero
+      if (heroRef.current) {
+        if (p <= 0.12) {
+          heroRef.current.style.opacity = 1;
+          heroRef.current.style.transform = 'translateY(0px)';
+        } else if (p < 0.18) {
+          const t = (p - 0.12) / 0.06;
+          heroRef.current.style.opacity = 1 - t;
+          heroRef.current.style.transform = `translateY(-${t * 24}px)`;
+        } else {
+          heroRef.current.style.opacity = 0;
+        }
+      }
+
+      // Scene 2 Left Card (Grand Salon)
+      if (scene2Ref.current) {
+        if (p >= 0.24 && p <= 0.43) {
+          let s2Op = 1;
+          if (p < 0.28) s2Op = (p - 0.24) / 0.04;
+          else if (p > 0.39) s2Op = 1 - (p - 0.39) / 0.04;
+          scene2Ref.current.style.opacity = s2Op;
+          scene2Ref.current.style.transform = `translateY(${(1 - s2Op) * 16}px)`;
+        } else {
+          scene2Ref.current.style.opacity = 0;
+        }
+      }
+
+      // Scene 3 Left Card (Azure Horizon)
+      if (scene3Ref.current) {
+        if (p >= 0.49 && p <= 0.68) {
+          let s3Op = 1;
+          if (p < 0.53) s3Op = (p - 0.49) / 0.04;
+          else if (p > 0.64) s3Op = 1 - (p - 0.64) / 0.04;
+          scene3Ref.current.style.opacity = s3Op;
+          scene3Ref.current.style.transform = `translateY(${(1 - s3Op) * 16}px)`;
+        } else {
+          scene3Ref.current.style.opacity = 0;
+        }
+      }
+
+      // Scene 4 Finale
+      if (scene4Ref.current) {
+        if (p >= 0.74 && p <= 0.94) {
+          let s4Op = 1;
+          if (p < 0.79) s4Op = (p - 0.74) / 0.05;
+          scene4Ref.current.style.opacity = s4Op;
+          scene4Ref.current.style.transform = `translateY(${(1 - s4Op) * 20}px)`;
+          scene4Ref.current.style.pointerEvents = s4Op >= 0.5 ? 'auto' : 'none';
+        } else {
+          scene4Ref.current.style.opacity = 0;
+          scene4Ref.current.style.pointerEvents = 'none';
+        }
+      }
+
+      // Entire Stage Dissolve into Portfolio Below
+      if (stageRef.current) {
+        if (p > 0.93) {
+          const stageOp = Math.max(0, 1 - (p - 0.93) / 0.06);
+          stageRef.current.style.opacity = stageOp;
+          stageRef.current.style.pointerEvents = stageOp < 0.1 ? 'none' : 'auto';
+        } else {
+          stageRef.current.style.opacity = 1;
+          stageRef.current.style.pointerEvents = 'auto';
         }
       }
 
@@ -231,18 +329,18 @@ export default function CinematicScrollJourney({ onOpenInquiry, onOpenDossier })
 
     rafId = requestAnimationFrame(updateLoop);
 
+    // 5. Cleanup
     return () => {
-      window.removeEventListener('scroll', handleScroll);
-      window.removeEventListener('pointerdown', primeAll);
-      window.removeEventListener('touchstart', primeAll);
       cancelAnimationFrame(rafId);
-      clearTimeout(scrollTimeoutRef.current);
+      window.removeEventListener('pointerdown', primeVideos);
+      window.removeEventListener('touchstart', primeVideos);
+      ctx.revert();
     };
   }, []);
 
   return (
     <section ref={containerRef} className="relative w-full bg-[#171716] text-[#F3F0EA] select-none">
-      {/* FULLSCREEN FIXED STAGE: Dissolves seamlessly into portfolio below when flight finishes */}
+      {/* FIXED 100% STAGE (No pin-spacer layout jumps) */}
       <div
         ref={stageRef}
         className="fixed inset-0 w-screen h-screen z-10 overflow-hidden bg-[#171716] transition-opacity duration-300"
@@ -285,13 +383,10 @@ export default function CinematicScrollJourney({ onOpenInquiry, onOpenDossier })
         <div className="absolute inset-0 z-30 pointer-events-none flex flex-col justify-between p-6 sm:p-12">
           <div className="w-full h-16" />
 
-          {/* SCENE 1 HERO CENTER OVERLAY: "EXPERIENCE TIMELESS LUXURY" */}
+          {/* SCENE 1 HERO CENTER OVERLAY */}
           <div
-            className={`absolute inset-0 flex flex-col items-center justify-center text-center px-4 sm:px-6 transition-all duration-700 pointer-events-none ${
-              activeSceneIndex === 0 && overallProgress < 0.18
-                ? 'opacity-100 scale-100'
-                : 'opacity-0 scale-95 -translate-y-6 pointer-events-none'
-            }`}
+            ref={heroRef}
+            className="absolute inset-0 flex flex-col items-center justify-center text-center px-4 sm:px-6 pointer-events-none transition-transform will-change-transform"
           >
             <span className="font-mono text-[10px] sm:text-sm tracking-[0.3em] sm:tracking-[0.35em] uppercase text-[#A38D70] mb-3 sm:mb-4">
               AURELIA RESIDENCE
@@ -309,13 +404,10 @@ export default function CinematicScrollJourney({ onOpenInquiry, onOpenDossier })
             </p>
           </div>
 
-          {/* SCENE 2 LEFT OVERLAY: "02 / THE GRAND SALON" */}
+          {/* SCENE 2 LEFT OVERLAY */}
           <div
-            className={`absolute left-4 sm:left-14 right-4 sm:right-auto bottom-16 sm:bottom-28 max-w-xs sm:max-w-lg transition-all duration-700 pointer-events-none ${
-              activeSceneIndex === 1
-                ? 'opacity-100 translate-y-0'
-                : 'opacity-0 translate-y-4'
-            }`}
+            ref={scene2Ref}
+            className="absolute left-4 sm:left-14 right-4 sm:right-auto bottom-16 sm:bottom-28 max-w-xs sm:max-w-lg pointer-events-none opacity-0 will-change-transform"
           >
             <span className="font-mono text-[10px] sm:text-xs tracking-[0.3em] uppercase text-[#A38D70] font-medium block mb-1.5">
               02 / THE GRAND SALON
@@ -328,13 +420,10 @@ export default function CinematicScrollJourney({ onOpenInquiry, onOpenDossier })
             </p>
           </div>
 
-          {/* SCENE 3 LEFT OVERLAY: "03 / THE AZURE HORIZON" */}
+          {/* SCENE 3 LEFT OVERLAY */}
           <div
-            className={`absolute left-4 sm:left-14 right-4 sm:right-auto bottom-16 sm:bottom-28 max-w-xs sm:max-w-lg transition-all duration-700 pointer-events-none ${
-              activeSceneIndex === 2
-                ? 'opacity-100 translate-y-0'
-                : 'opacity-0 translate-y-4'
-            }`}
+            ref={scene3Ref}
+            className="absolute left-4 sm:left-14 right-4 sm:right-auto bottom-16 sm:bottom-28 max-w-xs sm:max-w-lg pointer-events-none opacity-0 will-change-transform"
           >
             <span className="font-mono text-[10px] sm:text-xs tracking-[0.3em] uppercase text-[#A38D70] font-medium block mb-1.5">
               03 / THE AZURE HORIZON
@@ -347,13 +436,10 @@ export default function CinematicScrollJourney({ onOpenInquiry, onOpenDossier })
             </p>
           </div>
 
-          {/* SCENE 4 FINALE CENTER OVERLAY: "EVERY STAY BECOMES A MEMORY" */}
+          {/* SCENE 4 FINALE CENTER OVERLAY */}
           <div
-            className={`absolute inset-0 flex flex-col items-center justify-center text-center px-4 sm:px-6 transition-all duration-700 ${
-              activeSceneIndex === 3 && overallProgress >= 0.7 && overallProgress <= 0.94
-                ? 'opacity-100 scale-100 pointer-events-auto'
-                : 'opacity-0 scale-95 translate-y-6 pointer-events-none'
-            }`}
+            ref={scene4Ref}
+            className="absolute inset-0 flex flex-col items-center justify-center text-center px-4 sm:px-6 opacity-0 will-change-transform pointer-events-none"
           >
             <span className="font-mono text-[10px] sm:text-sm tracking-[0.3em] sm:tracking-[0.35em] uppercase text-[#A38D70] mb-3 sm:mb-4">
               04 / AERIAL PERSPECTIVE
@@ -366,7 +452,7 @@ export default function CinematicScrollJourney({ onOpenInquiry, onOpenDossier })
               </span>
             </h2>
 
-            <div className="flex flex-col sm:flex-row items-center justify-center gap-3 sm:gap-4 w-full sm:w-auto px-4 pointer-events-auto">
+            <div className="flex flex-col sm:flex-row items-center justify-center gap-3 sm:gap-4 w-full sm:w-auto px-4">
               <button
                 onClick={() => {
                   if (onOpenInquiry) onOpenInquiry();
@@ -395,15 +481,18 @@ export default function CinematicScrollJourney({ onOpenInquiry, onOpenDossier })
           <div className="w-full flex items-end justify-between pointer-events-none pb-2 sm:pb-3">
             <div className="flex items-center gap-2 sm:gap-3">
               <span className="w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full bg-[#A38D70]" />
-              <span className="font-mono text-[9px] sm:text-[11px] tracking-[0.2em] sm:tracking-[0.25em] text-[#C8BDAA]/80 uppercase">
-                {SCENES[activeSceneIndex].badge}
+              <span
+                ref={badgeRef}
+                className="font-mono text-[9px] sm:text-[11px] tracking-[0.2em] sm:tracking-[0.25em] text-[#C8BDAA]/80 uppercase"
+              >
+                {SCENES[activeScene].badge}
               </span>
             </div>
 
             {/* Mobile Scroll Indicator (Right aligned) */}
             <div
-              className={`sm:hidden flex items-center gap-1 font-mono text-[8px] tracking-wider text-[#A38D70] transition-opacity duration-500 ${
-                scrollHintVisible ? 'opacity-85' : 'opacity-0'
+              className={`sm:hidden flex items-center gap-1 font-mono text-[8px] tracking-wider text-[#A38D70] transition-opacity duration-300 ${
+                scrollHint ? 'opacity-85' : 'opacity-0'
               }`}
             >
               <span>SCROLL</span>
@@ -415,8 +504,8 @@ export default function CinematicScrollJourney({ onOpenInquiry, onOpenDossier })
 
       {/* DESKTOP CENTERED SCROLL CUE */}
       <div
-        className={`hidden sm:flex fixed bottom-6 left-1/2 -translate-x-1/2 z-30 pointer-events-none flex-col items-center gap-2 transition-opacity duration-500 ${
-          scrollHintVisible ? 'opacity-85' : 'opacity-0'
+        className={`hidden sm:flex fixed bottom-6 left-1/2 -translate-x-1/2 z-30 pointer-events-none flex-col items-center gap-2 transition-opacity duration-300 ${
+          scrollHint ? 'opacity-85' : 'opacity-0'
         }`}
       >
         <span className="font-mono text-[10px] tracking-[0.3em] uppercase text-[#C8BDAA]">
@@ -425,7 +514,7 @@ export default function CinematicScrollJourney({ onOpenInquiry, onOpenDossier })
         <div className="w-[1px] h-6 bg-gradient-to-b from-[#A38D70] to-transparent animate-pulse" />
       </div>
 
-      {/* TALL SCROLL TRACK SPACER */}
+      {/* TALL SCROLL TRACK SPACER (Ensures zero pin-spacer layout jumps) */}
       <div ref={trackRef} className="relative z-0 w-full pointer-events-none" />
     </section>
   );
